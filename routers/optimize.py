@@ -1,6 +1,3 @@
-# routers/optimize.py
-
-import random
 import time
 import math
 import logging
@@ -8,11 +5,10 @@ from fastapi import APIRouter, HTTPException
 from models.city import OptimizeRequest, OptimizeResponse
 
 from algorithms.antcolony import run_ant_colony
-from algorithms.genetic import run_genetic_algorithm
+from algorithms.genetic import run_genetic_algorithm, random_valid_population
 from algorithms.hybrid import run_hybrid_optimization
 from algorithms.local_search import two_opt
-
-# ── Logger config ─────────────────────────────────────────
+from algorithms.utils import build_graph, tour_distance
 
 logger = logging.getLogger("optimizer")
 logging.basicConfig(level=logging.INFO)
@@ -20,180 +16,172 @@ logging.basicConfig(level=logging.INFO)
 router = APIRouter(prefix="/optimize", tags=["Optimisation"])
 
 
-# ── Helpers ──────────────────────────────────────────────
-
-def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-
-
-def _total_distance(path: list[int], coords: list[tuple[float, float]]) -> float:
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+def _total_distance(path, coords, graph=None):
     if not path or len(path) < 2:
-        logger.warning("⚠️ Distance calculée sur path vide ou trop court")
         return 0.0
-
-    total = 0.0
-    n = len(path)
-
-    for i in range(n):
-        a = coords[path[i]]
-        b = coords[path[(i + 1) % n]]
-        total += _dist(a, b)
-
-    return round(total, 4)
+    return round(tour_distance(path, coords, graph), 4)
 
 
-def _generate_random_solution(n: int) -> list[int]:
-    indices = list(range(n))
-    random.shuffle(indices)
-    return indices
-
-
-def _rotate_to_start(tour: list[int], start_index: int) -> list[int]:
-    if start_index not in tour:
-        return tour[:]
+def _rotate_to_start(tour, start_index):
+    if start_index is None or start_index not in tour:
+        return tour
     idx = tour.index(start_index)
     return tour[idx:] + tour[:idx]
 
 
-# ── Wrappers normalisés ──────────────────────────────────
-# Chaque wrapper retourne toujours (tour_indices, distance)
-# pour uniformiser le traitement dans l'endpoint.
-
-def _run_antcolony(coords, **_) -> tuple[list[int], float]:
-    tour = run_ant_colony(coords)
-    return tour, _total_distance(tour, coords)
-
-
-def _run_genetic(coords, **_) -> tuple[list[int], float]:
-    tour = run_genetic_algorithm(coords)
-    return tour, _total_distance(tour, coords)
+# ─────────────────────────────────────────────────────────────
+# Algorithmes wrappers
+# ─────────────────────────────────────────────────────────────
+def _run_antcolony(coords, graph):
+    tour = run_ant_colony(coords, graph=graph)
+    return tour, _total_distance(tour, coords, graph)
 
 
-def _run_hybrid(coords, **_) -> tuple[list[int], float]:
-    # run_hybrid_optimization retourne déjà (tour, distance)
-    return run_hybrid_optimization(coords)
+def _run_genetic(coords, graph):
+    tour = run_genetic_algorithm(coords, graph=graph)
+    return tour, _total_distance(tour, coords, graph)
 
 
-def _run_local_search(coords, **_) -> tuple[list[int], float]:
-    # 2-opt seul : on part d'une solution aléatoire comme base
+def _run_hybrid(coords, graph):
+    return run_hybrid_optimization(coords, graph=graph)
+
+
+def _run_local_search(coords, graph):
     n = len(coords)
-    initial = list(range(n))
-    random.shuffle(initial)
-    tour = two_opt(initial, coords)
-    return tour, _total_distance(tour, coords)
+    candidates = random_valid_population(1, n, graph)
+    initial = candidates[0] if candidates else list(range(n))
+    tour = two_opt(initial, coords, graph=graph)
+    return tour, _total_distance(tour, coords, graph)
 
 
 ALGORITHMS = {
-    "antcolony":    _run_antcolony,
-    "genetic":      _run_genetic,
-    "hybrid":       _run_hybrid,
+    "antcolony": _run_antcolony,
+    "genetic": _run_genetic,
+    "hybrid": _run_hybrid,
     "local_search": _run_local_search,
 }
 
 
-# ── Endpoint principal ───────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────
+# Route principale
+# ─────────────────────────────────────────────────────────────
 @router.post("", response_model=OptimizeResponse)
 async def optimize(payload: OptimizeRequest) -> OptimizeResponse:
-    algo_name = payload.algorithm.lower()
-
-    logger.info("📥 Requête reçue — Algo: %s", algo_name)
-
-    if algo_name not in ALGORITHMS:
-        logger.error("❌ Algorithme inconnu: %s", algo_name)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Algorithme '{algo_name}' inconnu. Choix : {list(ALGORITHMS.keys())}",
-        )
 
     coords = [(c.x, c.y) for c in payload.cities]
-    names  = [c.name for c in payload.cities]
-    n      = len(coords)
+    names = [c.name for c in payload.cities]
+    n = len(coords)
 
     if n == 0:
         raise HTTPException(status_code=400, detail="Aucune ville fournie.")
 
-    # ── Ville de départ ───────────────────────────────────
-    start_index: int | None = None
+    # ── Graphe ────────────────────────────────────────────────
+    graph = None
+
+    if payload.edges:
+        edge_list = []
+        for edge in payload.edges:
+            if edge.city_a not in names or edge.city_b not in names:
+                raise HTTPException(status_code=400, detail="Arête invalide")
+
+            a_idx = names.index(edge.city_a)
+            b_idx = names.index(edge.city_b)
+            edge_list.append((a_idx, b_idx))
+
+        graph = build_graph(edge_list, n)
+        logger.info("🗺️ Graphe partiel : %d arêtes", len(edge_list))
+    else:
+        logger.info("🗺️ Graphe complet")
+
+    # ── Start city ────────────────────────────────────────────
+    start_index = None
     if payload.start_city:
         if payload.start_city not in names:
-            raise HTTPException(
-                status_code=400,
-                detail=f"start_city invalide : '{payload.start_city}'"
-            )
+            raise HTTPException(status_code=400, detail="start_city invalide")
         start_index = names.index(payload.start_city)
-        logger.info("🚀 Ville de départ : %s (index %d)", payload.start_city, start_index)
 
-    logger.info("📊 Nombre de villes : %d", n)
+    # ─────────────────────────────────────────────────────────
+    # 🔥 TEST DE TOUS LES ALGORITHMES
+    # ─────────────────────────────────────────────────────────
+    results = []
+    errors = {}
 
-    # ── Exécution de l'algorithme ─────────────────────────
-    algo_fn = ALGORITHMS[algo_name]
     t_start = time.perf_counter()
 
-    try:
-        tour_indices, optimal_distance = algo_fn(coords)
-    except Exception as exc:
-        logger.exception("💥 Erreur lors de l'exécution de '%s'", algo_name)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur algorithme '{algo_name}' : {exc}",
-        )
+    for name, algo in ALGORITHMS.items():
+        try:
+            logger.info(f"⚙️ Test : {name}")
+
+            tour, dist = algo(coords, graph)
+
+            if not tour or len(tour) != n:
+                raise ValueError("Tour invalide ou incomplet")
+
+            results.append({
+                "name": name,
+                "tour": tour,
+                "distance": dist
+            })
+
+        except Exception as e:
+            logger.warning(f"❌ {name} échoué : {e}")
+            errors[name] = str(e)
 
     elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
 
-    if not tour_indices or len(tour_indices) != n:
+    # ── Aucun algo valide ─────────────────────────────────────
+    if not results:
         raise HTTPException(
             status_code=500,
-            detail="Tour invalide retourné par l'algorithme (longueur incorrecte).",
+            detail={
+                "message": "Tous les algorithmes ont échoué",
+                "errors": errors
+            }
         )
 
-    logger.info("✅ Tour optimal indices : %s", tour_indices)
-    logger.info("📏 Distance optimale   : %.4f", optimal_distance)
-    logger.info("⏱  Temps d'exécution   : %.2f ms", elapsed_ms)
+    # ── Meilleur résultat ─────────────────────────────────────
+    best = min(results, key=lambda x: x["distance"])
 
-    # ── Rotation vers la ville de départ ─────────────────
-    if start_index is not None:
-        tour_indices = _rotate_to_start(tour_indices, start_index)
+    tour_indices = best["tour"]
+    optimal_distance = best["distance"]
+    algorithm_used = best["name"]
+
+    # ── Rotation ─────────────────────────────────────────────
+    tour_indices = _rotate_to_start(tour_indices, start_index)
 
     optimal_path = [names[i] for i in tour_indices]
-    logger.info("🧭 Chemin optimal : %s", optimal_path)
 
-    # ── Solution aléatoire (référence) ───────────────────
-    random_indices = _generate_random_solution(n)
-    if start_index is not None:
-        random_indices = _rotate_to_start(random_indices, start_index)
+    # ── Random solution ──────────────────────────────────────
+    rand_candidates = random_valid_population(1, n, graph)
+    random_indices = rand_candidates[0] if rand_candidates else list(range(n))
+    random_indices = _rotate_to_start(random_indices, start_index)
 
-    random_path     = [names[i] for i in random_indices]
-    random_distance = _total_distance(random_indices, coords)
+    random_path = [names[i] for i in random_indices]
+    random_distance = _total_distance(random_indices, coords, graph)
 
-    logger.info("🎲 Random path     : %s", random_path)
-    logger.info("📏 Random distance : %.4f", random_distance)
+    improvement = (
+        round(((random_distance - optimal_distance) / random_distance) * 100, 2)
+        if random_distance > 0 else 0.0
+    )
 
-    # ── Amélioration relative ────────────────────────────
-    if random_distance > 0:
-        improvement = round(
-            ((random_distance - optimal_distance) / random_distance) * 100, 2
-        )
-    else:
-        improvement = 0.0
-
-    logger.info("📈 Amélioration : %.2f%%", improvement)
-
-    # ── Réponse ──────────────────────────────────────────
+    # ── Réponse ──────────────────────────────────────────────
     return OptimizeResponse(
         optimal_path=optimal_path,
         total_distance=optimal_distance,
-        algorithm_used=algo_name,
+        algorithm_used=algorithm_used,
         execution_time_ms=elapsed_ms,
         random_path=random_path,
         random_distance=random_distance,
         improvement_percent=improvement,
+        start_city=payload.start_city,
+        errors=errors  # 🔥 important pour frontend
     )
 
 
-# ── Liste des algorithmes ─────────────────────────────────
-
+# ─────────────────────────────────────────────────────────────
 @router.get("/algorithms")
 async def list_algorithms():
-    logger.info("📡 Liste des algorithmes demandée")
     return {"algorithms": list(ALGORITHMS.keys())}

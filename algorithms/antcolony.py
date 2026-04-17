@@ -1,50 +1,20 @@
-"""
-algorithms/ant_colony.py
-Algorithme ACO (Ant Colony Optimization) pour le TSP.
-
-Principe :
-  - Chaque fourmi construit un tour complet en choisissant
-    la prochaine ville selon une probabilité combinant
-    phéromones (mémoire collective) et visibilité (1/distance).
-  - Après chaque itération, les phéromones s'évaporent
-    et les fourmis déposent sur leurs arêtes (meilleures = plus de dépôt).
-  - Après convergence, retourne le meilleur tour trouvé.
-"""
-
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
-from .utils import Tour, tour_distance, euclidean_distance
+from .utils import Tour, tour_distance, euclidean_distance, Graph, get_neighbors
 
-
-# ---------------------------------------------------------------------------
-# Construction d'un tour par une fourmi
-# ---------------------------------------------------------------------------
 
 def _ant_tour(
     pheromones: List[List[float]],
     coords: List[Tuple[float, float]],
     alpha: float,
     beta: float,
-) -> Tour:
+    graph: Graph = None,
+) -> Optional[Tour]:
     """
-    Construit un tour complet pour une fourmi.
-
-    À chaque étape, la fourmi choisit la prochaine ville
-    selon la règle de transition probabiliste :
-
-        P(i→j) ∝ τ(i,j)^alpha × η(i,j)^beta
-
-    où τ = phéromone et η = 1/distance (visibilité).
-
-    Args:
-        pheromones: Matrice des phéromones [n×n].
-        coords:     Coordonnées (x, y) des villes.
-        alpha:      Poids des phéromones (exploitation).
-        beta:       Poids de la visibilité (distance inverse).
-
-    Returns:
-        Tour complet : liste d'indices dans l'ordre de visite.
+    Construit un tour pour une fourmi en respectant la topologie du graphe.
+    Retourne None si aucun tour complet n'est possible depuis le point de départ
+    (graphe non connexe ou trop contraint).
     """
     n = len(coords)
     start = random.randint(0, n - 1)
@@ -55,27 +25,33 @@ def _ant_tour(
     for _ in range(n - 1):
         current = tour[-1]
 
-        # Calcul des scores pour chaque ville non visitée
+        # Voisins autorisés par le graphe ET non encore visités
+        neighbors = [
+            j for j in get_neighbors(current, graph, n)
+            if not visited[j]
+        ]
+
+        if not neighbors:
+            # Impasse : impossible de compléter le tour
+            return None
+
+        # Scores probabilistes τ^alpha × η^beta
         scores = []
-        candidates = []
-        for j in range(n):
-            if visited[j]:
-                continue
+        for j in neighbors:
             dist = euclidean_distance(coords[current], coords[j])
             visibility = 1.0 / dist if dist > 0 else 1e10
             score = (pheromones[current][j] ** alpha) * (visibility ** beta)
             scores.append(score)
-            candidates.append(j)
 
-        # Sélection probabiliste (roulette wheel)
+        # Sélection par roulette
         total = sum(scores)
         if total == 0:
-            next_city = random.choice(candidates)
+            next_city = random.choice(neighbors)
         else:
             pick = random.uniform(0, total)
             cumulative = 0.0
-            next_city = candidates[-1]  # fallback
-            for city, score in zip(candidates, scores):
+            next_city = neighbors[-1]
+            for city, score in zip(neighbors, scores):
                 cumulative += score
                 if cumulative >= pick:
                     next_city = city
@@ -84,12 +60,12 @@ def _ant_tour(
         visited[next_city] = True
         tour.append(next_city)
 
+    # Vérifier que le retour au départ est possible
+    if graph is not None and start not in graph.get(tour[-1], set()):
+        return None  # la boucle de retour n'existe pas
+
     return tour
 
-
-# ---------------------------------------------------------------------------
-# Mise à jour des phéromones
-# ---------------------------------------------------------------------------
 
 def _update_pheromones(
     pheromones: List[List[float]],
@@ -97,44 +73,30 @@ def _update_pheromones(
     coords: List[Tuple[float, float]],
     evaporation: float,
     q: float,
+    graph: Graph = None,
 ) -> None:
-    """
-    Met à jour la matrice de phéromones (in-place) :
-      1. Évaporation : toutes les phéromones diminuent.
-      2. Dépôt       : chaque fourmi dépose Q / distance sur ses arêtes.
-
-    Args:
-        pheromones:  Matrice à mettre à jour.
-        tours:       Tours construits par les fourmis cette itération.
-        coords:      Coordonnées des villes.
-        evaporation: Taux d'évaporation ρ ∈ ]0, 1[.
-        q:           Constante de dépôt (plus Q est grand, plus le dépôt est fort).
-    """
     n = len(pheromones)
 
-    # Évaporation
     for i in range(n):
         for j in range(n):
             pheromones[i][j] *= (1.0 - evaporation)
-            pheromones[i][j] = max(pheromones[i][j], 1e-6)  # seuil minimal
+            pheromones[i][j] = max(pheromones[i][j], 1e-6)
 
-    # Dépôt proportionnel à la qualité du tour
     for tour in tours:
-        dist = tour_distance(tour, coords)
-        deposit = q / dist if dist > 0 else 0.0
+        dist = tour_distance(tour, coords, graph)
+        if dist == float("inf") or dist == 0:
+            continue
+        deposit = q / dist
         for k in range(len(tour)):
             a = tour[k]
             b = tour[(k + 1) % len(tour)]
             pheromones[a][b] += deposit
-            pheromones[b][a] += deposit  # graphe non orienté
+            pheromones[b][a] += deposit
 
-
-# ---------------------------------------------------------------------------
-# Algorithme ACO principal
-# ---------------------------------------------------------------------------
 
 def run_ant_colony(
     coords: List[Tuple[float, float]],
+    graph: Graph = None,
     n_ants: int = 30,
     iterations: int = 100,
     alpha: float = 1.0,
@@ -143,47 +105,26 @@ def run_ant_colony(
     q: float = 100.0,
     initial_pheromone: float = 1.0,
 ) -> Tour:
-    """
-    Exécute l'algorithme ACO et retourne le meilleur tour trouvé.
-
-    Args:
-        coords:            Coordonnées (x, y) des villes.
-        n_ants:            Nombre de fourmis par itération.
-        iterations:        Nombre d'itérations.
-        alpha:             Influence des phéromones.
-        beta:              Influence de la visibilité (1/distance).
-        evaporation:       Taux d'évaporation (ρ).
-        q:                 Constante de dépôt de phéromones.
-        initial_pheromone: Valeur initiale de toutes les phéromones.
-
-    Returns:
-        Meilleur tour trouvé (liste d'indices).
-    """
     n = len(coords)
-
-    # Initialisation de la matrice de phéromones
-    pheromones: List[List[float]] = [
-        [initial_pheromone] * n for _ in range(n)
-    ]
+    pheromones = [[initial_pheromone] * n for _ in range(n)]
 
     best_tour: Tour = []
     best_distance = float("inf")
 
     for _ in range(iterations):
-        # Chaque fourmi construit son tour
-        iteration_tours = [
-            _ant_tour(pheromones, coords, alpha, beta)
-            for _ in range(n_ants)
-        ]
+        iteration_tours = []
+        for _ in range(n_ants):
+            tour = _ant_tour(pheromones, coords, alpha, beta, graph)
+            if tour is not None:          # ignorer les tours invalides
+                iteration_tours.append(tour)
 
-        # Mise à jour du meilleur global
         for tour in iteration_tours:
-            dist = tour_distance(tour, coords)
+            dist = tour_distance(tour, coords, graph)
             if dist < best_distance:
                 best_distance = dist
                 best_tour = tour[:]
 
-        # Évaporation + dépôt (uniquement les meilleurs tours de l'itération)
-        _update_pheromones(pheromones, iteration_tours, coords, evaporation, q)
+        if iteration_tours:
+            _update_pheromones(pheromones, iteration_tours, coords, evaporation, q, graph)
 
     return best_tour
