@@ -53,6 +53,13 @@ class OptimizeRequest(BaseModel):
     }
 
 
+class AlgoBreakdown(BaseModel):
+    """Résultat d'un algorithme individuel pour la comparaison frontend."""
+    name: str
+    distance: float
+    time_ms: float
+
+
 class OptimizeResponse(BaseModel):
     optimal_path: List[str]
     total_distance: float
@@ -62,3 +69,4 @@ class OptimizeResponse(BaseModel):
     algorithm_used: str
     execution_time_ms: float
     start_city: Optional[str] = None
+    breakdown: List[AlgoBreakdown] = Field(default_factory=list)
