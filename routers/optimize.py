@@ -127,9 +127,17 @@ async def optimize(payload: OptimizeRequest) -> OptimizeResponse:
         start_index = names.index(payload.start_city)
 
     # ─────────────────────────────────────────────────────────────────
-    # Lancement de TOUS les algorithmes pour comparaison empirique
-    # (mode benchmark — c'est l'objectif académique du projet ADOMC)
+    # Sélection des algorithmes à exécuter selon le payload :
+    #   • payload.algorithm == "all"  → lancement des 4 (mode benchmark)
+    #   • payload.algorithm in ALGORITHMS → un seul algo (mode focus)
+    # Cas par défaut : "all" pour rester compatible avec le mode académique.
     # ─────────────────────────────────────────────────────────────────
+    selected = payload.algorithm
+    if selected == "all" or selected not in ALGORITHMS:
+        algos_to_run = ALGORITHMS  # benchmark complet
+    else:
+        algos_to_run = {selected: ALGORITHMS[selected]}  # focus
+
     results = []
     errors: dict = {}
     t_start = time.perf_counter()
@@ -137,7 +145,7 @@ async def optimize(payload: OptimizeRequest) -> OptimizeResponse:
     # On mesure le temps PAR algorithme pour le breakdown affiché au front
     breakdown: list = []
 
-    for name, algo in ALGORITHMS.items():
+    for name, algo in algos_to_run.items():
         algo_t0 = time.perf_counter()
         try:
             logger.info("⚙️  Test : %s", name)

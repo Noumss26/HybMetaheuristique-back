@@ -26,7 +26,14 @@ class OptimizeRequest(BaseModel):
             "Si None → graphe complet (comportement actuel)."
         )
     )
-    algorithm: str = Field(default="antcolony")
+    algorithm: str = Field(
+        default="all",
+        description=(
+            "Sélection de l'algorithme : "
+            "'all' (comparaison des 4 — défaut), "
+            "'hybrid', 'antcolony', 'genetic', ou 'local_search' pour un seul."
+        ),
+    )
     start_city: Optional[str] = Field(default=None)
 
     model_config = {
